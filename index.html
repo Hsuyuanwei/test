@@ -3,8 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>五子棋 (Gomoku - 強化連線版)</title>
-    <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+    <title>五子棋 (Gomoku - 雲端頻道連線版)</title>
+    <!-- 引入 MQTT.js 透過 WebSocket 進行穩定連線 -->
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
     <style>
         body {
             font-family: "Microsoft JhengHei", sans-serif;
@@ -63,16 +64,6 @@
             color: #0066cc;
             font-weight: bold;
         }
-        #debugLog {
-            font-size: 0.8rem;
-            color: #666;
-            background: #eee;
-            padding: 6px 10px;
-            border-radius: 4px;
-            max-height: 60px;
-            overflow-y: auto;
-            font-family: monospace;
-        }
         canvas {
             background-color: #deb887;
             box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
@@ -83,20 +74,16 @@
 </head>
 <body>
 
-    <h1>五子棋（強化連線版）</h1>
+    <h1>五子棋（雲端頻道連線版）</h1>
 
     <div class="network-panel">
         <div class="row">
-            <span>你的房間 ID：</span>
-            <input type="text" id="myIdInput" readonly value="正在連線伺服器...">
-            <button onclick="copyId()">複製</button>
+            <span>自訂房間暗號：</span>
+            <input type="text" id="roomInput" placeholder="例如：8888 或 myroom">
+            <button id="createBtn" onclick="joinRoom(1)">開房(黑棋)</button>
+            <button id="joinBtn" onclick="joinRoom(2)">加入(白棋)</button>
         </div>
-        <div class="row">
-            <input type="text" id="remoteIdInput" placeholder="貼上對手的房間 ID">
-            <button id="connectBtn" onclick="connectToPeer()">加入對戰</button>
-        </div>
-        <div id="roleInfo">連線狀態：等待配對</div>
-        <div id="debugLog">系統日誌：初始化中...</div>
+        <div id="roleInfo">連線狀態：請輸入相同的「房間暗號」並選擇黑棋或白棋</div>
     </div>
 
     <div id="status">目前回合：黑棋</div>
@@ -110,15 +97,12 @@
         const ctx = canvas.getContext('2d');
         const statusEl = document.getElementById('status');
         const roleInfoEl = document.getElementById('roleInfo');
-        const debugLogEl = document.getElementById('debugLog');
-        const myIdInput = document.getElementById('myIdInput');
-        const remoteIdInput = document.getElementById('remoteIdInput');
-        const connectBtn = document.getElementById('connectBtn');
+        const roomInput = document.getElementById('roomInput');
+        const createBtn = document.getElementById('createBtn');
+        const joinBtn = document.getElementById('joinBtn');
 
-        function log(msg) {
-            debugLogEl.innerHTML += `<br>> ${msg}`;
-            debugLogEl.scrollTop = debugLogEl.scrollHeight;
-        }
+        // 預設產生一個 4 位數隨機房號方便測試
+        roomInput.value = Math.floor(1000 + Math.random() * 9000);
 
         let gameData = {
             "config": {
@@ -139,146 +123,87 @@
             }
         };
 
-        let peer = null;
-        let conn = null;
-        let myRole = 0;
+        let client = null;
+        let currentTopic = "";
+        let myRole = 0; // 0: 單機, 1: 黑棋, 2: 白棋
+        const myClientId = "gomoku_player_" + Math.random().toString(16).substring(2, 10);
 
-        // 1. 初始化 PeerJS（加入 STUN + 免費公共 TURN 伺服器穿透防火牆）
-        function initPeer() {
-            // 產生較短的 6 碼隨機房間 ID，方便手動輸入
-            const shortId = 'gomoku-' + Math.random().toString(36).substring(2, 8);
+        // 加入指定房間頻道
+        function joinRoom(role) {
+            const roomCode = roomInput.value.trim();
+            if (!roomCode) return alert("請輸入房間暗號！");
 
-            peer = new Peer(shortId, {
-                debug: 2,
-                config: {
-                    iceServers: [
-                        { urls: 'stun:stun.l.google.com:19302' },
-                        { urls: 'stun:stun1.l.google.com:19302' },
-                        {
-                            urls: 'turn:openrelay.metered.ca:80',
-                            username: 'openrelayproject',
-                            credential: 'openrelayproject'
-                        },
-                        {
-                            urls: 'turn:openrelay.metered.ca:443',
-                            username: 'openrelayproject',
-                            credential: 'openrelayproject'
+            myRole = role;
+            currentTopic = `tw/gomoku/game/room_${roomCode}`;
+            
+            roleInfoEl.textContent = "連線狀態：正在連入雲端房間...";
+            roleInfoEl.style.color = "#0066cc";
+            createBtn.disabled = true;
+            joinBtn.disabled = true;
+            roomInput.disabled = true;
+
+            // 連線到 EMQX 免費公共 WebSocket MQTT 伺服器（支援加密 WSS，穿透力極強）
+            client = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
+                clientId: myClientId,
+                clean: true,
+                connectTimeout: 5000
+            });
+
+            client.on('connect', () => {
+                // 訂閱該房間頻道
+                client.subscribe(currentTopic, (err) => {
+                    if (!err) {
+                        const roleName = myRole === 1 ? "【黑棋（先手）】" : "【白棋（後手）】";
+                        roleInfoEl.textContent = `已進入房間 [${roomCode}]！你是 ${roleName}`;
+                        roleInfoEl.style.color = "#28a745";
+                        initGame();
+                        
+                        // 廣播通知對手自己已進入房間
+                        sendMessage({ type: 'JOIN', role: myRole });
+                    }
+                });
+            });
+
+            // 收到頻道內的 JSON 訊息
+            client.on('message', (topic, message) => {
+                try {
+                    const data = JSON.parse(message.toString());
+                    // 忽略自己發出去的訊息
+                    if (data.sender === myClientId) return;
+
+                    if (data.type === 'JOIN') {
+                        const oppName = data.role === 1 ? "黑棋" : "白棋";
+                        roleInfoEl.textContent += ` ｜ 對手（${oppName}）已就位！`;
+                        // 如果是房主，同步一次目前棋盤給剛進來的對手
+                        if (myRole === 1) {
+                            sendMessage({ type: 'SYNC_STATE', state: gameData.state });
                         }
-                    ]
+                    } else if (data.type === 'SYNC_STATE') {
+                        gameData.state = data.state;
+                        drawBoard();
+                        updateStatusText();
+                    } else if (data.type === 'RESET') {
+                        initGame();
+                    }
+                } catch (e) {
+                    console.error("解析訊息失敗", e);
                 }
             });
 
-            peer.on('open', (id) => {
-                myIdInput.value = id;
-                log("已連線至配對伺服器，ID 就緒");
-            });
-
-            peer.on('connection', (connection) => {
-                log("收到來自對手的連線請求...");
-                if (conn && conn.open) {
-                    connection.close();
-                    return;
-                }
-                conn = connection;
-                myRole = 1;
-                setupConnectionEvents();
-            });
-
-            peer.on('disconnected', () => {
-                log("與配對伺服器斷線，嘗試重連...");
-                peer.reconnect();
-            });
-
-            peer.on('error', (err) => {
-                log("錯誤：" + err.type + " (" + err.message + ")");
-                connectBtn.disabled = false;
+            client.on('error', (err) => {
+                alert("連線伺服器失敗，請檢查網路狀態！");
+                createBtn.disabled = false;
+                joinBtn.disabled = false;
+                roomInput.disabled = false;
             });
         }
 
-        // 2. 主動連線
-        function connectToPeer() {
-            const remoteId = remoteIdInput.value.trim();
-            if (!remoteId) return alert("請先輸入對手的房間 ID！");
-            if (remoteId === myIdInput.value) return alert("不能連線給自己喔！");
-
-            log("正在嘗試連線至：" + remoteId);
-            roleInfoEl.textContent = "連線狀態：正在建立通道（約需 3~5 秒）...";
-            connectBtn.disabled = true;
-
-            // 強制使用 reliable: true 確保 JSON 封包不遺失
-            conn = peer.connect(remoteId, { reliable: true });
-            myRole = 2;
-            setupConnectionEvents();
-
-            // 設定 10 秒超時檢查
-            setTimeout(() => {
-                if (conn && !conn.open) {
-                    log("連線超時！可能是網路防火牆阻擋或 ID 輸入錯誤。");
-                    roleInfoEl.textContent = "連線狀態：連線超時，請重試";
-                    connectBtn.disabled = false;
-                }
-            }, 10000);
-        }
-
-        // 3. 監聽資料通道事件
-        function setupConnectionEvents() {
-            const onConnected = () => {
-                log("P2P 資料通道已成功開啟！");
-                if (myRole === 1) {
-                    roleInfoEl.textContent = "連線成功！你是【黑棋（先手）】";
-                    roleInfoEl.style.color = "#28a745";
-                } else if (myRole === 2) {
-                    roleInfoEl.textContent = "連線成功！你是【白棋（後手）】";
-                    roleInfoEl.style.color = "#28a745";
-                    conn.send({ type: 'HELLO' });
-                }
-                connectBtn.disabled = true;
-                initGame();
-            };
-
-            if (conn.open) {
-                onConnected();
-            } else {
-                conn.on('open', onConnected);
+        // 發送 JSON 資料到房間頻道
+        function sendMessage(payload) {
+            if (client && client.connected && currentTopic) {
+                payload.sender = myClientId;
+                client.publish(currentTopic, JSON.stringify(payload));
             }
-
-            conn.on('data', (data) => {
-                if (data.type === 'HELLO') {
-                    log("收到對手握手確認！");
-                    roleInfoEl.textContent = "連線成功！你是【黑棋（先手）】";
-                    roleInfoEl.style.color = "#28a745";
-                    connectBtn.disabled = true;
-                    initGame();
-                } else if (data.type === 'SYNC_STATE') {
-                    gameData.state = data.state;
-                    drawBoard();
-                    updateStatusText();
-                } else if (data.type === 'RESET') {
-                    initGame();
-                }
-            });
-
-            conn.on('close', () => {
-                log("連線已關閉");
-                roleInfoEl.textContent = "連線狀態：對手已離線";
-                roleInfoEl.style.color = "#d9534f";
-                myRole = 0;
-                connectBtn.disabled = false;
-            });
-
-            conn.on('error', (err) => {
-                log("通道錯誤：" + err);
-            });
-        }
-
-        function copyId() {
-            myIdInput.select();
-            navigator.clipboard.writeText(myIdInput.value).then(() => {
-                alert("已複製房間 ID：" + myIdInput.value);
-            }).catch(() => {
-                document.execCommand('copy');
-                alert("已複製房間 ID！");
-            });
         }
 
         function initGame() {
@@ -408,12 +333,11 @@
                 drawBoard();
                 updateStatusText();
 
-                if (conn && conn.open) {
-                    conn.send({
-                        type: 'SYNC_STATE',
-                        state: gameData.state
-                    });
-                }
+                // 將最新 JSON 狀態廣播給房間內的對手
+                sendMessage({
+                    type: 'SYNC_STATE',
+                    state: gameData.state
+                });
             }
         });
 
@@ -446,13 +370,10 @@
 
         function requestReset() {
             initGame();
-            if (conn && conn.open) {
-                conn.send({ type: 'RESET' });
-            }
+            sendMessage({ type: 'RESET' });
         }
 
         initGame();
-        initPeer();
     </script>
 </body>
 </html>
