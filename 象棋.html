@@ -7,60 +7,9 @@
     <!-- 引入 MQTT.js 透過 WebSocket 進行穩定連線 -->
     <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
     <style>
-        body {
-            font-family: "Microsoft JhengHei", "標楷體", sans-serif;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            background-color: #f4f4f9;
-            margin: 0;
-            padding: 20px;
-        }
-        h1 { color: #333; margin-bottom: 10px; }
-        .network-panel {
-            background: #fff;
-            padding: 15px 20px;
-            border-radius: 8px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-            margin-bottom: 15px;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            width: 460px;
-            max-width: 95vw;
-            box-sizing: border-box;
-        }
-        .row {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 8px;
-            flex-wrap: wrap;
-        }
-        input[type="text"] {
-            padding: 6px 10px;
-            border: 1px solid #ccc;
-            border-radius: 4px;
-            font-size: 0.95rem;
-            flex: 1;
-            min-width: 100px;
-        }
-        button {
-            padding: 7px 14px;
-            font-size: 0.95rem;
-            background-color: #5c4033;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            white-space: nowrap;
-        }
-        button:hover { background-color: #3e2b22; }
-        button:disabled { background-color: #aaa; cursor: not-allowed; }
-        .btn-red { background-color: #b22222; }
-        .btn-red:hover { background-color: #8b0000; }
-        .btn-black { background-color: #2c3e50; }
-        .btn-black:hover { background-color: #1a252f; }
+       body{
+        text-align: center;
+       }
         #status {
             font-size: 1.25rem;
             font-weight: bold;
@@ -83,17 +32,26 @@
 </head>
 <body>
 
-    <h1>中國象棋（雲端連線版）</h1>
+    <h1>中國象棋</h1>
 
     <div class="network-panel">
         <div class="row">
-            <span>房間暗號：</span>
-            <input type="text" id="roomInput" placeholder="輸入相同暗號">
+            <span>房號：</span>
+            <input type="text" id="roomInput" placeholder="輸入相同房號">
             <button id="redBtn" class="btn-red" onclick="joinRoom('r')">開房(紅方)</button>
             <button id="blackBtn" class="btn-black" onclick="joinRoom('b')">加入(黑方)</button>
+            <button onclick="leaveRoom()">退出房間</button>
         </div>
         <div id="roleInfo">連線狀態：尚未連線（目前為單機雙人模式）</div>
-        <p>2026/11/13</p>
+        <details>
+            <summary>連線操作說明</summary>
+            <div>
+                開房: <br>
+                請輸入四位數房號 開房<br>
+                加入: <br>
+                輸入與開房者相同之四位數房號 加入
+            </div>
+        </details>
     </div>
 
     <div id="status">目前回合：紅方</div>
@@ -101,6 +59,7 @@
     <canvas id="board" width="460" height="510"></canvas>
     <div style="margin-top: 15px;">
         <button onclick="requestReset()">重新開局</button>
+        <p>許元洧維護</p>
     </div>
 
     <script>
@@ -111,9 +70,6 @@
         const roomInput = document.getElementById('roomInput');
         const redBtn = document.getElementById('redBtn');
         const blackBtn = document.getElementById('blackBtn');
-
-        // 預設產生隨機 4 位數房號
-        roomInput.value = Math.floor(1000 + Math.random() * 9000);
 
         // 象棋資料結構 (JSON)
         // 代號說明：r=紅方, b=黑方 | K=帥/將, A=仕/士, E=相/象, H=傌/馬, R=俥/車, C=炮/包, P=兵/卒
@@ -143,7 +99,8 @@
         // MQTT 連線變數
         let client = null;
         let currentTopic = "";
-        let myRole = "local";         // "local": 單機, "r": 紅方, "b": 黑方
+        let presenceTopicBase = "";
+        let myRole = "local";         // "local": 單機, "r": 紅方, "b": 黑方, "spectator": 觀戰
         const myClientId = "xiangqi_" + Math.random().toString(16).substring(2, 10);
 
         // 初始化標準象棋開局陣列
@@ -162,49 +119,170 @@
             ];
         }
 
-        // 加入雲端房間
-        function joinRoom(role) {
+        // 退出房間並清除線上狀態
+        function leaveRoom() {
+            if (client && client.connected && (myRole === 'r' || myRole === 'b')) {
+                client.publish(`${presenceTopicBase}/${myRole}`, '', { retain: true }, () => {
+                    location.reload();
+                });
+            } else {
+                location.reload();
+            }
+        }
+
+        // 加入雲端房間（含防重複開房與第三人觀戰判定）
+        function joinRoom(requestedRole) {
             const roomCode = roomInput.value.trim();
-            if (!roomCode) return alert("請輸入房間暗號！");
+            if (!roomCode) return alert("請輸入房號！");
 
-            myRole = role;
             currentTopic = `tw/xiangqi/game/room_${roomCode}`;
+            presenceTopicBase = `tw/xiangqi/presence/room_${roomCode}`;
 
-            roleInfoEl.textContent = "連線狀態：正在連入雲端房間...";
+            roleInfoEl.textContent = "連線狀態：正在檢查房間狀態...";
             roleInfoEl.style.color = "#0066cc";
             redBtn.disabled = true;
             blackBtn.disabled = true;
             roomInput.disabled = true;
 
+            // 暫存房間內紅黑雙方佔用狀態
+            let roomOccupancy = { r: null, b: null };
+            let hasEntered = false;
+
+            // 設定斷線遺囑 (Will)，若異常關閉視窗自動清除佔位
             client = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
                 clientId: myClientId,
                 clean: true,
-                connectTimeout: 5000
+                connectTimeout: 5000,
+                will: {
+                    topic: `${presenceTopicBase}/${requestedRole}`,
+                    payload: '',
+                    retain: true
+                }
             });
 
             client.on('connect', () => {
-                client.subscribe(currentTopic, (err) => {
+                // 同時訂閱遊戲頻道與房間座位狀態頻道
+                client.subscribe([currentTopic, `${presenceTopicBase}/+`], (err) => {
                     if (!err) {
-                        const roleText = myRole === 'r' ? "【紅方（先手）】" : "【黑方（後手）】";
-                        roleInfoEl.textContent = `已進入房間 [${roomCode}]！你是 ${roleText}`;
-                        roleInfoEl.style.color = "#28a745";
-                        initGame();
-                        sendMessage({ type: 'JOIN', role: myRole });
+                        // 發送探測訊號，確保能抓到目前線上的玩家
+                        sendMessage({ type: 'PROBE' });
+
+                        // 等待 700ms 接收 Broker 保留訊息與線上玩家回應後再決定身分
+                        setTimeout(() => {
+                            if (hasEntered) return;
+                            hasEntered = true;
+
+                            const rOccupied = Boolean(roomOccupancy.r);
+                            const bOccupied = Boolean(roomOccupancy.b);
+
+                            // 規則 1：若紅黑兩方皆已有人，第三人自動轉為觀戰
+                            if (rOccupied && bOccupied) {
+                                myRole = 'spectator';
+                                // 觀戰者不佔用任何座位，覆蓋清空自己預設的遺囑位置（不影響原本玩家）
+                                roleInfoEl.textContent = `已進入房間 [${roomCode}]！房間已滿，你目前為【觀戰模式】`;
+                                roleInfoEl.style.color = "#d97706";
+                                initGame();
+                                sendMessage({ type: 'REQUEST_SYNC' });
+                                return;
+                            }
+
+                            // 規則 2：若選擇「開房(紅方)」，但紅方位置已有人（房間已開啟）
+                            if (requestedRole === 'r' && rOccupied) {
+                                alert(`房間 [${roomCode}] 已經開啟（紅方已存在），禁止開啟相同房號房間！\n若要加入對戰請按「加入(黑方)」。`);
+                                client.end(true);
+                                resetUI();
+                                return;
+                            }
+
+                            // 規則 3：若選擇「加入(黑方)」，但黑方位置已被佔用
+                            if (requestedRole === 'b' && bOccupied) {
+                                alert(`房間 [${roomCode}] 的黑方位置已被佔用！`);
+                                client.end(true);
+                                resetUI();
+                                return;
+                            }
+
+                            // 合法進入房間並鎖定座位（使用 retain: true 宣告佔位）
+                            myRole = requestedRole;
+                            client.publish(
+                                `${presenceTopicBase}/${myRole}`,
+                                JSON.stringify({ clientId: myClientId, role: myRole }),
+                                { retain: true }
+                            );
+
+                            const roleText = myRole === 'r' ? "【紅方（先手）】" : "【黑方（後手）】";
+                            roleInfoEl.textContent = `已進入房間 [${roomCode}]！你是 ${roleText}`;
+                            roleInfoEl.style.color = "#28a745";
+
+                            if ((myRole === 'r' && bOccupied) || (myRole === 'b' && rOccupied)) {
+                                const oppText = myRole === 'r' ? "黑方" : "紅方";
+                                roleInfoEl.textContent += ` ｜ 對手（${oppText}）已就位！`;
+                            }
+
+                            initGame();
+                            sendMessage({ type: 'JOIN', role: myRole });
+                            if (myRole === 'b' && rOccupied) {
+                                sendMessage({ type: 'REQUEST_SYNC' });
+                            }
+                        }, 700);
                     }
                 });
             });
 
             client.on('message', (topic, message) => {
+                const msgStr = message.toString();
+
+                // 處理座位狀態頻道訊息
+                if (topic.startsWith(presenceTopicBase + '/')) {
+                    const roleKey = topic.split('/').pop(); // 'r' 或 'b'
+                    if (roleKey === 'r' || roleKey === 'b') {
+                        if (!msgStr) {
+                            roomOccupancy[roleKey] = null;
+                        } else {
+                            try {
+                                const info = JSON.parse(msgStr);
+                                roomOccupancy[roleKey] = info.clientId;
+                            } catch (e) {}
+                        }
+                    }
+                    return;
+                }
+
+                // 處理遊戲頻道訊息
                 try {
-                    const data = JSON.parse(message.toString());
+                    const data = JSON.parse(msgStr);
                     if (data.sender === myClientId) return;
 
+                    // 收到探測訊號時，若自己已是紅或黑方，主動回報存在
+                    if (data.type === 'PROBE') {
+                        if (myRole === 'r' || myRole === 'b') {
+                            sendMessage({ type: 'PRESENCE_ACK', role: myRole });
+                        }
+                        return;
+                    }
+
+                    if (data.type === 'PRESENCE_ACK') {
+                        if (data.role === 'r' || data.role === 'b') {
+                            roomOccupancy[data.role] = data.sender;
+                        }
+                        return;
+                    }
+
                     if (data.type === 'JOIN') {
-                        const oppText = data.role === 'r' ? "紅方" : "黑方";
-                        if (!roleInfoEl.textContent.includes("已就位")) {
-                            roleInfoEl.textContent += ` ｜ 對手（${oppText}）已就位！`;
+                        if (data.role === 'r' || data.role === 'b') {
+                            roomOccupancy[data.role] = data.sender;
+                        }
+                        if (myRole === 'r' || myRole === 'b') {
+                            const oppText = data.role === 'r' ? "紅方" : "黑方";
+                            if (!roleInfoEl.textContent.includes("已就位")) {
+                                roleInfoEl.textContent += ` ｜ 對手（${oppText}）已就位！`;
+                            }
                         }
                         if (myRole === 'r') {
+                            sendMessage({ type: 'SYNC_STATE', state: gameData.state });
+                        }
+                    } else if (data.type === 'REQUEST_SYNC') {
+                        if (myRole === 'r' || myRole === 'b') {
                             sendMessage({ type: 'SYNC_STATE', state: gameData.state });
                         }
                     } else if (data.type === 'SYNC_STATE') {
@@ -223,10 +301,17 @@
 
             client.on('error', () => {
                 alert("連線伺服器失敗，請檢查網路狀態！");
-                redBtn.disabled = false;
-                blackBtn.disabled = false;
-                roomInput.disabled = false;
+                resetUI();
             });
+        }
+
+        function resetUI() {
+            myRole = "local";
+            redBtn.disabled = false;
+            blackBtn.disabled = false;
+            roomInput.disabled = false;
+            roleInfoEl.textContent = "連線狀態：尚未連線（目前為單機雙人模式）";
+            roleInfoEl.style.color = "#0066cc";
         }
 
         function sendMessage(payload) {
@@ -256,7 +341,9 @@
                 statusEl.style.color = "#d9534f";
             } else {
                 let text = "目前回合：" + (turn === 'r' ? "紅方" : "黑方");
-                if (myRole !== "local") {
+                if (myRole === "spectator") {
+                    text += "（觀戰中）";
+                } else if (myRole !== "local") {
                     text += (turn === myRole) ? "（輪到你走棋！）" : "（等待對手...）";
                 }
                 statusEl.textContent = text;
@@ -264,7 +351,7 @@
             }
         }
 
-        // 座標轉換：若我是黑方，將棋盤上下左右翻轉，讓自己的棋子永遠在下方
+        // 座標轉換：若我是黑方，將棋盤上下左右翻轉，讓自己的棋子永遠在下方（觀戰者維持紅方視角）
         function toScreenCoords(r, c) {
             const { rows, cols, cellSize, padding } = gameData.config;
             const displayR = (myRole === 'b') ? (rows - 1 - r) : r;
@@ -441,6 +528,7 @@
         // 點擊棋盤互動
         canvas.addEventListener('click', (e) => {
             if (gameData.state.gameOver) return;
+            if (myRole === "spectator") return; // 觀戰者不可操作棋盤
             if (myRole !== "local" && gameData.state.turn !== myRole) return;
 
             const rect = canvas.getBoundingClientRect();
@@ -496,7 +584,7 @@
             drawBoard();
             updateStatusText();
 
-            // 同步 JSON 狀態給對手
+            // 同步 JSON 狀態給對手與觀戰者
             sendMessage({
                 type: 'SYNC_STATE',
                 state: gameData.state
@@ -626,6 +714,7 @@
         }
 
         function requestReset() {
+            if (myRole === "spectator") return alert("觀戰模式下無法重新開局！");
             initGame();
             sendMessage({ type: 'RESET' });
         }
