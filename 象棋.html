@@ -251,7 +251,7 @@
 
                             // 規則 3：若選擇「加入(黑方)」，但黑方位置已被佔用
                             if (requestedRole === 'b' && bOccupied) {
-                                alert(`房間 [${roomCode}] 的黑方位置已被佔用！請開房進入紅方位置`);
+                                alert(`房間 [${roomCode}] 的黑方位置已被佔用！\n若要加入對戰請按「開房(紅方)」。`);
                                 client.end(true);
                                 client = null;
                                 resetUI();
