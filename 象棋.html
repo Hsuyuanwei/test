@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>中國象棋 (Chinese Chess - 雲端頻道連線版)</title>
+    <!-- 引入 MQTT.js 透過 WebSocket 進行穩定連線 -->
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        body {
+            font-family: "Microsoft JhengHei", "標楷體", sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            background-color: #f4f4f9;
+            margin: 0;
+            padding: 20px;
+        }
+        h1 { color: #333; margin-bottom: 10px; }
+        .network-panel {
+            background: #fff;
+            padding: 15px 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin-bottom: 15px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            width: 460px;
+            max-width: 95vw;
+            box-sizing: border-box;
+        }
+        .row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        input[type="text"] {
+            padding: 6px 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 0.95rem;
+            flex: 1;
+            min-width: 100px;
+        }
+        button {
+            padding: 7px 14px;
+            font-size: 0.95rem;
+            background-color: #5c4033;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        button:hover { background-color: #3e2b22; }
+        button:disabled { background-color: #aaa; cursor: not-allowed; }
+        .btn-red { background-color: #b22222; }
+        .btn-red:hover { background-color: #8b0000; }
+        .btn-black { background-color: #2c3e50; }
+        .btn-black:hover { background-color: #1a252f; }
+        #status {
+            font-size: 1.25rem;
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #444;
+        }
+        #roleInfo {
+            font-size: 0.95rem;
+            color: #0066cc;
+            font-weight: bold;
+        }
+        canvas {
+            background-color: #f0c78a;
+            box-shadow: 0 6px 15px rgba(0, 0, 0, 0.35);
+            cursor: pointer;
+            border-radius: 6px;
+            border: 4px solid #5c4033;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>中國象棋（雲端連線版）</h1>
+
+    <div class="network-panel">
+        <div class="row">
+            <span>房間暗號：</span>
+            <input type="text" id="roomInput" placeholder="輸入相同暗號">
+            <button id="redBtn" class="btn-red" onclick="joinRoom('r')">開房(紅方)</button>
+            <button id="blackBtn" class="btn-black" onclick="joinRoom('b')">加入(黑方)</button>
+        </div>
+        <div id="roleInfo">連線狀態：尚未連線（目前為單機雙人模式）</div>
+        <p>2026/11/13</p>
+    </div>
+
+    <div id="status">目前回合：紅方</div>
+    <!-- 9x10 格點，每格 50px，上下左右留邊距 -->
+    <canvas id="board" width="460" height="510"></canvas>
+    <div style="margin-top: 15px;">
+        <button onclick="requestReset()">重新開局</button>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('board');
+        const ctx = canvas.getContext('2d');
+        const statusEl = document.getElementById('status');
+        const roleInfoEl = document.getElementById('roleInfo');
+        const roomInput = document.getElementById('roomInput');
+        const redBtn = document.getElementById('redBtn');
+        const blackBtn = document.getElementById('blackBtn');
+
+        // 預設產生隨機 4 位數房號
+        roomInput.value = Math.floor(1000 + Math.random() * 9000);
+
+        // 象棋資料結構 (JSON)
+        // 代號說明：r=紅方, b=黑方 | K=帥/將, A=仕/士, E=相/象, H=傌/馬, R=俥/車, C=炮/包, P=兵/卒
+        let gameData = {
+            "config": {
+                "cols": 9,
+                "rows": 10,
+                "cellSize": 50,
+                "padding": 30,
+                "pieceNames": {
+                    "rK": "帥", "rA": "仕", "rE": "相", "rH": "傌", "rR": "俥", "rC": "炮", "rP": "兵",
+                    "bK": "將", "bA": "士", "bE": "象", "bH": "馬", "bR": "車", "bC": "包", "bP": "卒"
+                }
+            },
+            "state": {
+                "turn": "r",          // 'r': 紅方先手, 'b': 黑方後手
+                "gameOver": false,
+                "winner": null,
+                "lastMove": null,     // { from: {r, c}, to: {r, c} }
+                "grid": []            // 10x9 二維陣列
+            }
+        };
+
+        let selected = null;          // 目前選取的棋子 { r, c }
+        let validMoves = [];          // 目前選取棋子的可走位置 [{ r, c }, ...]
+
+        // MQTT 連線變數
+        let client = null;
+        let currentTopic = "";
+        let myRole = "local";         // "local": 單機, "r": 紅方, "b": 黑方
+        const myClientId = "xiangqi_" + Math.random().toString(16).substring(2, 10);
+
+        // 初始化標準象棋開局陣列
+        function getInitialGrid() {
+            return [
+                ["bR", "bH", "bE", "bA", "bK", "bA", "bE", "bH", "bR"],
+                [null, null, null, null, null, null, null, null, null],
+                [null, "bC", null, null, null, null, null, "bC", null],
+                ["bP", null, "bP", null, "bP", null, "bP", null, "bP"],
+                [null, null, null, null, null, null, null, null, null],
+                [null, null, null, null, null, null, null, null, null],
+                ["rP", null, "rP", null, "rP", null, "rP", null, "rP"],
+                [null, "rC", null, null, null, null, null, "rC", null],
+                [null, null, null, null, null, null, null, null, null],
+                ["rR", "rH", "rE", "rA", "rK", "rA", "rE", "rH", "rR"]
+            ];
+        }
+
+        // 加入雲端房間
+        function joinRoom(role) {
+            const roomCode = roomInput.value.trim();
+            if (!roomCode) return alert("請輸入房間暗號！");
+
+            myRole = role;
+            currentTopic = `tw/xiangqi/game/room_${roomCode}`;
+
+            roleInfoEl.textContent = "連線狀態：正在連入雲端房間...";
+            roleInfoEl.style.color = "#0066cc";
+            redBtn.disabled = true;
+            blackBtn.disabled = true;
+            roomInput.disabled = true;
+
+            client = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
+                clientId: myClientId,
+                clean: true,
+                connectTimeout: 5000
+            });
+
+            client.on('connect', () => {
+                client.subscribe(currentTopic, (err) => {
+                    if (!err) {
+                        const roleText = myRole === 'r' ? "【紅方（先手）】" : "【黑方（後手）】";
+                        roleInfoEl.textContent = `已進入房間 [${roomCode}]！你是 ${roleText}`;
+                        roleInfoEl.style.color = "#28a745";
+                        initGame();
+                        sendMessage({ type: 'JOIN', role: myRole });
+                    }
+                });
+            });
+
+            client.on('message', (topic, message) => {
+                try {
+                    const data = JSON.parse(message.toString());
+                    if (data.sender === myClientId) return;
+
+                    if (data.type === 'JOIN') {
+                        const oppText = data.role === 'r' ? "紅方" : "黑方";
+                        if (!roleInfoEl.textContent.includes("已就位")) {
+                            roleInfoEl.textContent += ` ｜ 對手（${oppText}）已就位！`;
+                        }
+                        if (myRole === 'r') {
+                            sendMessage({ type: 'SYNC_STATE', state: gameData.state });
+                        }
+                    } else if (data.type === 'SYNC_STATE') {
+                        gameData.state = data.state;
+                        selected = null;
+                        validMoves = [];
+                        drawBoard();
+                        updateStatusText();
+                    } else if (data.type === 'RESET') {
+                        initGame();
+                    }
+                } catch (e) {
+                    console.error("解析封包錯誤", e);
+                }
+            });
+
+            client.on('error', () => {
+                alert("連線伺服器失敗，請檢查網路狀態！");
+                redBtn.disabled = false;
+                blackBtn.disabled = false;
+                roomInput.disabled = false;
+            });
+        }
+
+        function sendMessage(payload) {
+            if (client && client.connected && currentTopic) {
+                payload.sender = myClientId;
+                client.publish(currentTopic, JSON.stringify(payload));
+            }
+        }
+
+        function initGame() {
+            gameData.state.grid = getInitialGrid();
+            gameData.state.turn = 'r';
+            gameData.state.gameOver = false;
+            gameData.state.winner = null;
+            gameData.state.lastMove = null;
+            selected = null;
+            validMoves = [];
+
+            drawBoard();
+            updateStatusText();
+        }
+
+        function updateStatusText() {
+            const { turn, gameOver, winner } = gameData.state;
+            if (gameOver) {
+                statusEl.textContent = (winner === 'r' ? "紅方" : "黑方") + " 獲勝！";
+                statusEl.style.color = "#d9534f";
+            } else {
+                let text = "目前回合：" + (turn === 'r' ? "紅方" : "黑方");
+                if (myRole !== "local") {
+                    text += (turn === myRole) ? "（輪到你走棋！）" : "（等待對手...）";
+                }
+                statusEl.textContent = text;
+                statusEl.style.color = turn === 'r' ? "#b22222" : "#222";
+            }
+        }
+
+        // 座標轉換：若我是黑方，將棋盤上下左右翻轉，讓自己的棋子永遠在下方
+        function toScreenCoords(r, c) {
+            const { rows, cols, cellSize, padding } = gameData.config;
+            const displayR = (myRole === 'b') ? (rows - 1 - r) : r;
+            const displayC = (myRole === 'b') ? (cols - 1 - c) : c;
+            return {
+                x: padding + displayC * cellSize,
+                y: padding + displayR * cellSize
+            };
+        }
+
+        function toBoardCoords(x, y) {
+            const { rows, cols, cellSize, padding } = gameData.config;
+            const displayC = Math.round((x - padding) / cellSize);
+            const displayR = Math.round((y - padding) / cellSize);
+            return {
+                r: (myRole === 'b') ? (rows - 1 - displayR) : displayR,
+                c: (myRole === 'b') ? (cols - 1 - displayC) : displayC
+            };
+        }
+
+        // 繪製整個象棋盤與棋子
+        function drawBoard() {
+            const { rows, cols, cellSize, padding } = gameData.config;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            ctx.strokeStyle = "#4a2e1b";
+            ctx.lineWidth = 1.5;
+
+            // 1. 畫橫線 (10條)
+            for (let r = 0; r < rows; r++) {
+                const y = padding + r * cellSize;
+                ctx.beginPath();
+                ctx.moveTo(padding, y);
+                ctx.lineTo(padding + (cols - 1) * cellSize, y);
+                ctx.stroke();
+            }
+
+            // 2. 畫直線 (左右邊線貫通，中間7條在楚河漢界斷開)
+            for (let c = 0; c < cols; c++) {
+                const x = padding + c * cellSize;
+                if (c === 0 || c === cols - 1) {
+                    ctx.beginPath();
+                    ctx.moveTo(x, padding);
+                    ctx.lineTo(x, padding + (rows - 1) * cellSize);
+                    ctx.stroke();
+                } else {
+                    // 上半部
+                    ctx.beginPath();
+                    ctx.moveTo(x, padding);
+                    ctx.lineTo(x, padding + 4 * cellSize);
+                    ctx.stroke();
+                    // 下半部
+                    ctx.beginPath();
+                    ctx.moveTo(x, padding + 5 * cellSize);
+                    ctx.lineTo(x, padding + 9 * cellSize);
+                    ctx.stroke();
+                }
+            }
+
+            // 3. 畫九宮格斜線
+            const palaces = [
+                { r1: 0, c1: 3, r2: 2, c2: 5 },
+                { r1: 0, c1: 5, r2: 2, c2: 3 },
+                { r1: 7, c1: 3, r2: 9, c2: 5 },
+                { r1: 7, c1: 5, r2: 9, c2: 3 }
+            ];
+            for (let p of palaces) {
+                ctx.beginPath();
+                ctx.moveTo(padding + p.c1 * cellSize, padding + p.r1 * cellSize);
+                ctx.lineTo(padding + p.c2 * cellSize, padding + p.r2 * cellSize);
+                ctx.stroke();
+            }
+
+            // 4. 畫「楚河 漢界」文字
+            ctx.save();
+            ctx.font = "bold 24px '標楷體', 'Microsoft JhengHei', serif";
+            ctx.fillStyle = "#5c3a21";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            const riverY = padding + 4.5 * cellSize;
+            if (myRole === 'b') {
+                ctx.fillText("漢 界", padding + 2 * cellSize, riverY);
+                ctx.fillText("楚 河", padding + 6 * cellSize, riverY);
+            } else {
+                ctx.fillText("楚 河", padding + 2 * cellSize, riverY);
+                ctx.fillText("漢 界", padding + 6 * cellSize, riverY);
+            }
+            ctx.restore();
+
+            // 5. 標示上一步移動軌跡
+            if (gameData.state.lastMove) {
+                const { from, to } = gameData.state.lastMove;
+                drawHighlightBox(from.r, from.c, "rgba(0, 123, 255, 0.45)");
+                drawHighlightBox(to.r, to.c, "rgba(0, 123, 255, 0.75)");
+            }
+
+            // 6. 繪製所有棋子
+            for (let r = 0; r < rows; r++) {
+                for (let c = 0; c < cols; c++) {
+                    const piece = gameData.state.grid[r][c];
+                    if (piece) {
+                        const isSelected = selected && selected.r === r && selected.c === c;
+                        drawPiece(r, c, piece, isSelected);
+                    }
+                }
+            }
+
+            // 7. 繪製可移動位置提示點
+            for (let m of validMoves) {
+                const pos = toScreenCoords(m.r, m.c);
+                const targetPiece = gameData.state.grid[m.r][m.c];
+                ctx.beginPath();
+                if (targetPiece) {
+                    // 可吃子：畫紅色外圈
+                    ctx.arc(pos.x, pos.y, 23, 0, Math.PI * 2);
+                    ctx.strokeStyle = "rgba(220, 53, 69, 0.85)";
+                    ctx.lineWidth = 3;
+                    ctx.stroke();
+                } else {
+                    // 空位可走：畫綠色小圓點
+                    ctx.arc(pos.x, pos.y, 7, 0, Math.PI * 2);
+                    ctx.fillStyle = "rgba(40, 167, 69, 0.8)";
+                    ctx.fill();
+                }
+            }
+        }
+
+        function drawHighlightBox(r, c, color) {
+            const pos = toScreenCoords(r, c);
+            const size = 22;
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2.5;
+            ctx.strokeRect(pos.x - size, pos.y - size, size * 2, size * 2);
+        }
+
+        function drawPiece(r, c, pieceCode, isSelected) {
+            const pos = toScreenCoords(r, c);
+            const radius = 21;
+            const side = pieceCode[0]; // 'r' or 'b'
+            const label = gameData.config.pieceNames[pieceCode];
+
+            // 棋子陰影與底色
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
+            ctx.shadowColor = "rgba(0, 0, 0, 0.4)";
+            ctx.shadowBlur = isSelected ? 10 : 4;
+            ctx.shadowOffsetY = isSelected ? 4 : 2;
+            ctx.fillStyle = isSelected ? "#fff8dc" : "#f7e3b5";
+            ctx.fill();
+            ctx.restore();
+
+            // 棋子外框與內圈刻線
+            ctx.beginPath();
+            ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
+            ctx.strokeStyle = isSelected ? "#ff9800" : "#5c4033";
+            ctx.lineWidth = isSelected ? 3 : 2;
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.arc(pos.x, pos.y, radius - 3, 0, Math.PI * 2);
+            ctx.strokeStyle = side === 'r' ? "#c0392b" : "#2c3e50";
+            ctx.lineWidth = 1;
+            ctx.stroke();
+
+            // 棋子文字
+            ctx.font = "bold 22px '標楷體', 'Microsoft JhengHei', serif";
+            ctx.fillStyle = side === 'r' ? "#c0392b" : "#1a1a1a";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(label, pos.x, pos.y + 1);
+        }
+
+        // 點擊棋盤互動
+        canvas.addEventListener('click', (e) => {
+            if (gameData.state.gameOver) return;
+            if (myRole !== "local" && gameData.state.turn !== myRole) return;
+
+            const rect = canvas.getBoundingClientRect();
+            const { r, c } = toBoardCoords(e.clientX - rect.left, e.clientY - rect.top);
+
+            if (r < 0 || r >= 10 || c < 0 || c >= 9) return;
+
+            const clickedPiece = gameData.state.grid[r][c];
+            const currentTurn = gameData.state.turn;
+
+            // 若點擊的是「合法移動目標」
+            if (selected && validMoves.some(m => m.r === r && m.c === c)) {
+                executeMove(selected.r, selected.c, r, c);
+                return;
+            }
+
+            // 若點擊的是己方棋子，則選取並計算合法步數
+            if (clickedPiece && clickedPiece[0] === currentTurn) {
+                selected = { r, c };
+                validMoves = getValidMoves(r, c, gameData.state.grid);
+                drawBoard();
+            } else {
+                selected = null;
+                validMoves = [];
+                drawBoard();
+            }
+        });
+
+        // 執行移動並檢查勝負
+        function executeMove(fromR, fromC, toR, toC) {
+            const grid = gameData.state.grid;
+            const movingPiece = grid[fromR][fromC];
+            const targetPiece = grid[toR][toC];
+
+            grid[toR][toC] = movingPiece;
+            grid[fromR][fromC] = null;
+
+            gameData.state.lastMove = {
+                from: { r: fromR, c: fromC },
+                to: { r: toR, c: toC }
+            };
+
+            // 檢查是否吃掉對方的「帥」或「將」
+            if (targetPiece === 'rK' || targetPiece === 'bK') {
+                gameData.state.gameOver = true;
+                gameData.state.winner = movingPiece[0];
+            } else {
+                gameData.state.turn = (gameData.state.turn === 'r') ? 'b' : 'r';
+            }
+
+            selected = null;
+            validMoves = [];
+            drawBoard();
+            updateStatusText();
+
+            // 同步 JSON 狀態給對手
+            sendMessage({
+                type: 'SYNC_STATE',
+                state: gameData.state
+            });
+        }
+
+        // ==================== 中國象棋完整走法規則引擎 ====================
+        function getValidMoves(r, c, grid) {
+            const piece = grid[r][c];
+            if (!piece) return [];
+
+            const side = piece[0]; // 'r' or 'b'
+            const type = piece[1]; // K, A, E, H, R, C, P
+            const moves = [];
+
+            const inBoard = (nr, nc) => nr >= 0 && nr < 10 && nc >= 0 && nc < 9;
+            const isFriend = (nr, nc) => grid[nr][nc] && grid[nr][nc][0] === side;
+            const canLand = (nr, nc) => inBoard(nr, nc) && !isFriend(nr, nc);
+
+            if (type === 'K') { // 帥 / 將
+                const dirs = [[1,0], [-1,0], [0,1], [0,-1]];
+                for (let [dr, dc] of dirs) {
+                    const nr = r + dr, nc = c + dc;
+                    const inPalace = (side === 'r')
+                        ? (nr >= 7 && nr <= 9 && nc >= 3 && nc <= 5)
+                        : (nr >= 0 && nr <= 2 && nc >= 3 && nc <= 5);
+                    if (inPalace && canLand(nr, nc)) moves.push({ r: nr, c: nc });
+                }
+                // 王見王（飛將）規則
+                const step = side === 'r' ? -1 : 1;
+                for (let nr = r + step; inBoard(nr, c); nr += step) {
+                    if (grid[nr][c]) {
+                        if (grid[nr][c][1] === 'K') moves.push({ r: nr, c });
+                        break;
+                    }
+                }
+            }
+            else if (type === 'A') { // 仕 / 士
+                const dirs = [[1,1], [1,-1], [-1,1], [-1,-1]];
+                for (let [dr, dc] of dirs) {
+                    const nr = r + dr, nc = c + dc;
+                    const inPalace = (side === 'r')
+                        ? (nr >= 7 && nr <= 9 && nc >= 3 && nc <= 5)
+                        : (nr >= 0 && nr <= 2 && nc >= 3 && nc <= 5);
+                    if (inPalace && canLand(nr, nc)) moves.push({ r: nr, c: nc });
+                }
+            }
+            else if (type === 'E') { // 相 / 象 (田字 + 塞象眼 + 不可過河)
+                const dirs = [[2,2], [2,-2], [-2,2], [-2,-2]];
+                for (let [dr, dc] of dirs) {
+                    const nr = r + dr, nc = c + dc;
+                    const eyeR = r + dr / 2, eyeC = c + dc / 2;
+                    const notCrossRiver = (side === 'r') ? (nr >= 5) : (nr <= 4);
+                    if (notCrossRiver && canLand(nr, nc) && !grid[eyeR][eyeC]) {
+                        moves.push({ r: nr, c: nc });
+                    }
+                }
+            }
+            else if (type === 'H') { // 傌 / 馬 (日字 + 拐馬腳)
+                const horseSteps = [
+                    { dr: -2, dc: -1, legR: -1, legC: 0 },
+                    { dr: -2, dc:  1, legR: -1, legC: 0 },
+                    { dr:  2, dc: -1, legR:  1, legC: 0 },
+                    { dr:  2, dc:  1, legR:  1, legC: 0 },
+                    { dr: -1, dc: -2, legR: 0, legC: -1 },
+                    { dr:  1, dc: -2, legR: 0, legC: -1 },
+                    { dr: -1, dc:  2, legR: 0, legC:  1 },
+                    { dr:  1, dc:  2, legR: 0, legC:  1 }
+                ];
+                for (let s of horseSteps) {
+                    const nr = r + s.dr, nc = c + s.dc;
+                    const lr = r + s.legR, lc = c + s.legC;
+                    if (canLand(nr, nc) && !grid[lr][lc]) {
+                        moves.push({ r: nr, c: nc });
+                    }
+                }
+            }
+            else if (type === 'R') { // 俥 / 車 (直線無阻擋)
+                const dirs = [[1,0], [-1,0], [0,1], [0,-1]];
+                for (let [dr, dc] of dirs) {
+                    let nr = r + dr, nc = c + dc;
+                    while (inBoard(nr, nc)) {
+                        if (!grid[nr][nc]) {
+                            moves.push({ r: nr, c: nc });
+                        } else {
+                            if (!isFriend(nr, nc)) moves.push({ r: nr, c: nc });
+                            break;
+                        }
+                        nr += dr; nc += dc;
+                    }
+                }
+            }
+            else if (type === 'C') { // 炮 / 包 (移動同車，吃子需隔一山)
+                const dirs = [[1,0], [-1,0], [0,1], [0,-1]];
+                for (let [dr, dc] of dirs) {
+                    let nr = r + dr, nc = c + dc;
+                    let jumped = false;
+                    while (inBoard(nr, nc)) {
+                        if (!jumped) {
+                            if (!grid[nr][nc]) {
+                                moves.push({ r: nr, c: nc });
+                            } else {
+                                jumped = true; // 遇到第一個棋子當作炮架
+                            }
+                        } else {
+                            if (grid[nr][nc]) {
+                                if (!isFriend(nr, nc)) moves.push({ r: nr, c: nc });
+                                break;
+                            }
+                        }
+                        nr += dr; nc += dc;
+                    }
+                }
+            }
+            else if (type === 'P') { // 兵 / 卒 (過河前只能向前，過河後可左右)
+                const forward = (side === 'r') ? -1 : 1;
+                const crossedRiver = (side === 'r') ? (r <= 4) : (r >= 5);
+
+                if (canLand(r + forward, c)) moves.push({ r: r + forward, c });
+                if (crossedRiver) {
+                    if (canLand(r, c - 1)) moves.push({ r, c: c - 1 });
+                    if (canLand(r, c + 1)) moves.push({ r, c: c + 1 });
+                }
+            }
+
+            return moves;
+        }
+
+        function requestReset() {
+            initGame();
+            sendMessage({ type: 'RESET' });
+        }
+
+        initGame();
+    </script>
+</body>
+</html>
