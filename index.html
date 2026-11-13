@@ -3,8 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>五子棋 (Gomoku - 多人連線版)</title>
-    <!-- 引入 PeerJS 函式庫實現瀏覽器點對點連線 -->
+    <title>五子棋 (Gomoku - 強化連線版)</title>
     <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
     <style>
         body {
@@ -49,7 +48,6 @@
             border: none;
             border-radius: 5px;
             cursor: pointer;
-            transition: background 0.2s;
             white-space: nowrap;
         }
         button:hover { background-color: #3e2b22; }
@@ -65,6 +63,16 @@
             color: #0066cc;
             font-weight: bold;
         }
+        #debugLog {
+            font-size: 0.8rem;
+            color: #666;
+            background: #eee;
+            padding: 6px 10px;
+            border-radius: 4px;
+            max-height: 60px;
+            overflow-y: auto;
+            font-family: monospace;
+        }
         canvas {
             background-color: #deb887;
             box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
@@ -75,20 +83,20 @@
 </head>
 <body>
 
-    <h1>五子棋（多人連線版）</h1>
+    <h1>五子棋（強化連線版）</h1>
 
-    <!-- 連線控制面板 -->
     <div class="network-panel">
         <div class="row">
             <span>你的房間 ID：</span>
-            <input type="text" id="myIdInput" readonly value="正在取得連線 ID...">
+            <input type="text" id="myIdInput" readonly value="正在連線伺服器...">
             <button onclick="copyId()">複製</button>
         </div>
         <div class="row">
             <input type="text" id="remoteIdInput" placeholder="貼上對手的房間 ID">
             <button id="connectBtn" onclick="connectToPeer()">加入對戰</button>
         </div>
-        <div id="roleInfo">連線狀態：尚未連線（可先單機練習）</div>
+        <div id="roleInfo">連線狀態：等待配對</div>
+        <div id="debugLog">系統日誌：初始化中...</div>
     </div>
 
     <div id="status">目前回合：黑棋</div>
@@ -102,11 +110,16 @@
         const ctx = canvas.getContext('2d');
         const statusEl = document.getElementById('status');
         const roleInfoEl = document.getElementById('roleInfo');
+        const debugLogEl = document.getElementById('debugLog');
         const myIdInput = document.getElementById('myIdInput');
         const remoteIdInput = document.getElementById('remoteIdInput');
         const connectBtn = document.getElementById('connectBtn');
 
-        // 棋盤 JSON 資料結構
+        function log(msg) {
+            debugLogEl.innerHTML += `<br>> ${msg}`;
+            debugLogEl.scrollTop = debugLogEl.scrollHeight;
+        }
+
         let gameData = {
             "config": {
                 "boardSize": 15,
@@ -126,30 +139,44 @@
             }
         };
 
-        // 連線相關變數
         let peer = null;
         let conn = null;
-        let myRole = 0; // 0: 單機, 1: 黑棋(房主), 2: 白棋(加入者)
+        let myRole = 0;
 
-        // 1. 初始化 PeerJS 取得專屬 ID（加入 STUN 伺服器支援跨網路連線）
+        // 1. 初始化 PeerJS（加入 STUN + 免費公共 TURN 伺服器穿透防火牆）
         function initPeer() {
-            peer = new Peer({
+            // 產生較短的 6 碼隨機房間 ID，方便手動輸入
+            const shortId = 'gomoku-' + Math.random().toString(36).substring(2, 8);
+
+            peer = new Peer(shortId, {
+                debug: 2,
                 config: {
-                    'iceServers': [
+                    iceServers: [
                         { urls: 'stun:stun.l.google.com:19302' },
-                        { urls: 'stun:stun1.l.google.com:19302' }
+                        { urls: 'stun:stun1.l.google.com:19302' },
+                        {
+                            urls: 'turn:openrelay.metered.ca:80',
+                            username: 'openrelayproject',
+                            credential: 'openrelayproject'
+                        },
+                        {
+                            urls: 'turn:openrelay.metered.ca:443',
+                            username: 'openrelayproject',
+                            credential: 'openrelayproject'
+                        }
                     ]
                 }
             });
 
             peer.on('open', (id) => {
                 myIdInput.value = id;
+                log("已連線至配對伺服器，ID 就緒");
             });
 
-            // 當別人連進來時（我方當房主，執黑棋）
             peer.on('connection', (connection) => {
+                log("收到來自對手的連線請求...");
                 if (conn && conn.open) {
-                    connection.close(); // 已經在對戰中則拒絕第三者
+                    connection.close();
                     return;
                 }
                 conn = connection;
@@ -157,53 +184,67 @@
                 setupConnectionEvents();
             });
 
+            peer.on('disconnected', () => {
+                log("與配對伺服器斷線，嘗試重連...");
+                peer.reconnect();
+            });
+
             peer.on('error', (err) => {
-                alert("連線發生錯誤：" + err.type);
-                roleInfoEl.textContent = "連線狀態：發生錯誤，請重新整理網頁";
+                log("錯誤：" + err.type + " (" + err.message + ")");
                 connectBtn.disabled = false;
             });
         }
 
-        // 2. 主動連線到對手的房間（我方當挑戰者，執白棋）
+        // 2. 主動連線
         function connectToPeer() {
             const remoteId = remoteIdInput.value.trim();
             if (!remoteId) return alert("請先輸入對手的房間 ID！");
             if (remoteId === myIdInput.value) return alert("不能連線給自己喔！");
 
-            roleInfoEl.textContent = "連線狀態：正在連線中...";
+            log("正在嘗試連線至：" + remoteId);
+            roleInfoEl.textContent = "連線狀態：正在建立通道（約需 3~5 秒）...";
             connectBtn.disabled = true;
-            conn = peer.connect(remoteId);
+
+            // 強制使用 reliable: true 確保 JSON 封包不遺失
+            conn = peer.connect(remoteId, { reliable: true });
             myRole = 2;
             setupConnectionEvents();
+
+            // 設定 10 秒超時檢查
+            setTimeout(() => {
+                if (conn && !conn.open) {
+                    log("連線超時！可能是網路防火牆阻擋或 ID 輸入錯誤。");
+                    roleInfoEl.textContent = "連線狀態：連線超時，請重試";
+                    connectBtn.disabled = false;
+                }
+            }, 10000);
         }
 
-        // 3. 設定連線後的資料收發監聽（修正房主端時間差問題）
+        // 3. 監聽資料通道事件
         function setupConnectionEvents() {
             const onConnected = () => {
+                log("P2P 資料通道已成功開啟！");
                 if (myRole === 1) {
                     roleInfoEl.textContent = "連線成功！你是【黑棋（先手）】";
                     roleInfoEl.style.color = "#28a745";
                 } else if (myRole === 2) {
                     roleInfoEl.textContent = "連線成功！你是【白棋（後手）】";
                     roleInfoEl.style.color = "#28a745";
-                    // 白棋連上後，主動發送打招呼封包喚醒房主
                     conn.send({ type: 'HELLO' });
                 }
                 connectBtn.disabled = true;
                 initGame();
             };
 
-            // 若通道在綁定事件前已開啟則直接執行；否則監聽 open 事件
             if (conn.open) {
                 onConnected();
             } else {
                 conn.on('open', onConnected);
             }
 
-            // 收到對手傳來的 JSON 資料
             conn.on('data', (data) => {
                 if (data.type === 'HELLO') {
-                    // 收到白棋的打招呼，確保房主狀態更新為連線成功
+                    log("收到對手握手確認！");
                     roleInfoEl.textContent = "連線成功！你是【黑棋（先手）】";
                     roleInfoEl.style.color = "#28a745";
                     connectBtn.disabled = true;
@@ -218,25 +259,28 @@
             });
 
             conn.on('close', () => {
-                alert("對手已斷開連線！");
+                log("連線已關閉");
                 roleInfoEl.textContent = "連線狀態：對手已離線";
                 roleInfoEl.style.color = "#d9534f";
                 myRole = 0;
                 connectBtn.disabled = false;
+            });
+
+            conn.on('error', (err) => {
+                log("通道錯誤：" + err);
             });
         }
 
         function copyId() {
             myIdInput.select();
             navigator.clipboard.writeText(myIdInput.value).then(() => {
-                alert("已複製你的房間 ID，傳給朋友即可連線！");
+                alert("已複製房間 ID：" + myIdInput.value);
             }).catch(() => {
                 document.execCommand('copy');
-                alert("已複製你的房間 ID！");
+                alert("已複製房間 ID！");
             });
         }
 
-        // 初始化棋盤
         function initGame() {
             const size = gameData.config.boardSize;
             gameData.state.grid = Array.from({ length: size }, () => Array(size).fill(0));
@@ -248,7 +292,6 @@
             updateStatusText();
         }
 
-        // 更新上方回合提示文字
         function updateStatusText() {
             const { currentPlayer, gameOver } = gameData.state;
             if (gameOver) {
@@ -264,7 +307,6 @@
             }
         }
 
-        // 繪製棋盤與棋子
         function drawBoard() {
             const { boardSize, cellSize, padding, stars } = gameData.config;
             const { grid, winLine } = gameData.state;
@@ -341,14 +383,9 @@
             ctx.stroke();
         }
 
-        // 點擊落子
         canvas.addEventListener('click', (e) => {
             if (gameData.state.gameOver) return;
-
-            // 如果是連線模式，且還沒輪到自己，禁止下棋
-            if (myRole !== 0 && gameData.state.currentPlayer !== myRole) {
-                return;
-            }
+            if (myRole !== 0 && gameData.state.currentPlayer !== myRole) return;
 
             const { boardSize, cellSize, padding } = gameData.config;
             const rect = canvas.getBoundingClientRect();
@@ -371,7 +408,6 @@
                 drawBoard();
                 updateStatusText();
 
-                // 若在連線中，把最新 JSON 狀態傳給對手
                 if (conn && conn.open) {
                     conn.send({
                         type: 'SYNC_STATE',
@@ -415,7 +451,6 @@
             }
         }
 
-        // 啟動遊戲與連線服務
         initGame();
         initPeer();
     </script>
