@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>中國象棋</title>
+    <title>中國象棋 (Chinese Chess - 雲端頻道連線版)</title>
     <!-- 引入 MQTT.js 透過 WebSocket 進行穩定連線 -->
     <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
     <style>
@@ -251,7 +251,7 @@
 
                             // 規則 3：若選擇「加入(黑方)」，但黑方位置已被佔用
                             if (requestedRole === 'b' && bOccupied) {
-                                alert(`房間 [${roomCode}] 的黑方位置已被佔用！\n若要加入對戰請按「開房(紅方)」。`);
+                                alert(`房間 [${roomCode}] 的黑方位置已被佔用！`);
                                 client.end(true);
                                 client = null;
                                 resetUI();
