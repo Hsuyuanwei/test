@@ -131,9 +131,16 @@
         let conn = null;
         let myRole = 0; // 0: 單機, 1: 黑棋(房主), 2: 白棋(加入者)
 
-        // 1. 初始化 PeerJS 取得專屬 ID
+        // 1. 初始化 PeerJS 取得專屬 ID（加入 STUN 伺服器支援跨網路連線）
         function initPeer() {
-            peer = new Peer();
+            peer = new Peer({
+                config: {
+                    'iceServers': [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:stun1.l.google.com:19302' }
+                    ]
+                }
+            });
 
             peer.on('open', (id) => {
                 myIdInput.value = id;
@@ -148,13 +155,12 @@
                 conn = connection;
                 myRole = 1;
                 setupConnectionEvents();
-                roleInfoEl.textContent = "連線成功！你是【黑棋（先手）】";
-                connectBtn.disabled = true;
-                initGame();
             });
 
             peer.on('error', (err) => {
                 alert("連線發生錯誤：" + err.type);
+                roleInfoEl.textContent = "連線狀態：發生錯誤，請重新整理網頁";
+                connectBtn.disabled = false;
             });
         }
 
@@ -164,24 +170,45 @@
             if (!remoteId) return alert("請先輸入對手的房間 ID！");
             if (remoteId === myIdInput.value) return alert("不能連線給自己喔！");
 
+            roleInfoEl.textContent = "連線狀態：正在連線中...";
+            connectBtn.disabled = true;
             conn = peer.connect(remoteId);
             myRole = 2;
             setupConnectionEvents();
         }
 
-        // 3. 設定連線後的資料收發監聽
+        // 3. 設定連線後的資料收發監聽（修正房主端時間差問題）
         function setupConnectionEvents() {
-            conn.on('open', () => {
-                if (myRole === 2) {
+            const onConnected = () => {
+                if (myRole === 1) {
+                    roleInfoEl.textContent = "連線成功！你是【黑棋（先手）】";
+                    roleInfoEl.style.color = "#28a745";
+                } else if (myRole === 2) {
                     roleInfoEl.textContent = "連線成功！你是【白棋（後手）】";
-                    connectBtn.disabled = true;
-                    initGame();
+                    roleInfoEl.style.color = "#28a745";
+                    // 白棋連上後，主動發送打招呼封包喚醒房主
+                    conn.send({ type: 'HELLO' });
                 }
-            });
+                connectBtn.disabled = true;
+                initGame();
+            };
+
+            // 若通道在綁定事件前已開啟則直接執行；否則監聽 open 事件
+            if (conn.open) {
+                onConnected();
+            } else {
+                conn.on('open', onConnected);
+            }
 
             // 收到對手傳來的 JSON 資料
             conn.on('data', (data) => {
-                if (data.type === 'SYNC_STATE') {
+                if (data.type === 'HELLO') {
+                    // 收到白棋的打招呼，確保房主狀態更新為連線成功
+                    roleInfoEl.textContent = "連線成功！你是【黑棋（先手）】";
+                    roleInfoEl.style.color = "#28a745";
+                    connectBtn.disabled = true;
+                    initGame();
+                } else if (data.type === 'SYNC_STATE') {
                     gameData.state = data.state;
                     drawBoard();
                     updateStatusText();
@@ -193,6 +220,7 @@
             conn.on('close', () => {
                 alert("對手已斷開連線！");
                 roleInfoEl.textContent = "連線狀態：對手已離線";
+                roleInfoEl.style.color = "#d9534f";
                 myRole = 0;
                 connectBtn.disabled = false;
             });
@@ -200,8 +228,12 @@
 
         function copyId() {
             myIdInput.select();
-            document.execCommand('copy');
-            alert("已複製你的房間 ID，傳給朋友即可連線！");
+            navigator.clipboard.writeText(myIdInput.value).then(() => {
+                alert("已複製你的房間 ID，傳給朋友即可連線！");
+            }).catch(() => {
+                document.execCommand('copy');
+                alert("已複製你的房間 ID！");
+            });
         }
 
         // 初始化棋盤
